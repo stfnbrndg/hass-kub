@@ -3,12 +3,12 @@
   "name": "Knoxville Utilities Board",
   "codeowners": ["@jackjpowell"],
   "config_flow": true,
-  "dependencies": ["network"],
+  "dependencies": ["http"],
   "documentation": "https://github.com/JackJPowell/hass-kub",
   "homekit": {},
   "integration_type": "device",
   "iot_class": "cloud_polling",
-  "requirements": ["kub==0.5.0"],
+  "requirements": [],
   "ssdp": [],
-  "version": "0.5.0"
+  "version": "0.6.0"
 }

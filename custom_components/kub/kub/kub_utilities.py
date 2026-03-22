@@ -1,4 +1,8 @@
-"""Knoxville Utilities Board API"""
+"""Knoxville Utilities Board API
+
+Authenticates via OAuth2 Bearer token. The access token is obtained
+by HA's OAuth2 config flow (Azure AD B2C PKCE) and passed to this class.
+"""
 
 import copy
 from datetime import datetime, timedelta, timezone
@@ -11,7 +15,6 @@ class HTTPError(BaseException):
     """Raised when an HTTP operation fails."""
 
     def __init__(self, status_code, message) -> None:
-        """Raise HTTP Error."""
         self.status_code = status_code
         self.message = message
         super().__init__(self.message, self.status_code)
@@ -31,13 +34,20 @@ class KUBUtilityTypes(Enum):
 
 
 class Http:
-    """Simple http class to wrap api calls"""
+    """HTTP client with Bearer token auth."""
 
-    def __init__(self) -> None:
-        self._session = any
+    def __init__(self, access_token: str = "") -> None:
+        self._session = None
+        self._access_token = access_token
 
     async def __aenter__(self):
-        self._session = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=10))
+        headers = {}
+        if self._access_token:
+            headers["Authorization"] = f"Bearer {self._access_token}"
+        self._session = aiohttp.ClientSession(
+            timeout=aiohttp.ClientTimeout(total=30),
+            headers=headers,
+        )
         return self
 
     async def __aexit__(self, *err):
@@ -45,29 +55,46 @@ class Http:
         self._session = None
 
     async def fetch(self, url):
-        """http get"""
+        """HTTP GET with auth error handling."""
         resp = await self._session.get(url)
+        if resp.status == 401:
+            raise KUBAuthenticationError("Access token expired or invalid")
         resp.raise_for_status()
         return resp
 
     async def post(self, url, payload):
-        """HTTP post"""
+        """HTTP POST with auth error handling."""
         resp = await self._session.post(url, json=payload)
+        if resp.status == 401:
+            raise KUBAuthenticationError("Access token expired or invalid")
         resp.raise_for_status()
         return resp
 
 
 class KubUtility:
-    """KUB utilities api"""
+    """KUB utilities API client.
 
-    def __init__(self, username, password):
-        self.username = username
-        self.password = password
+    Can be initialized with either:
+    - access_token (OAuth2 B2C flow, preferred)
+    - username + password (legacy, will fail with B2C)
+    """
+
+    def __init__(self, username_or_token: str = "", password: str = ""):
+        # Support both old (username, password) and new (token) signatures
+        if password:
+            # Legacy mode — will fail on B2C auth
+            self.username = username_or_token
+            self.password = password
+            self.access_token = ""
+        else:
+            # OAuth2 mode — token-based
+            self.username = ""
+            self.password = ""
+            self.access_token = username_or_token
+
         self.person_id = ""
         self.account_id = ""
-
         self.account = {}
-        self.session_start = ""
         self.usage = {"electricity": {}, "gas": {}, "water": {}, "wastewater": {}}
         self.monthly_total = {
             "electricity": {"usage": None, "cost": None},
@@ -79,38 +106,53 @@ class KubUtility:
         self.service_list = []
         self.http = None
 
-    @property
-    def is_session_active(self):
-        """Getter that returns if session was created within 15m"""
-        if datetime.now() < datetime.now() - timedelta(minutes=15):
-            return True
-        return False
+    def update_token(self, access_token: str):
+        """Update the access token (called after refresh)."""
+        self.access_token = access_token
 
     async def _retrieve_access_token(self):
-        """Retrieve Access Token from KUB api"""
-        payload = {}
-        session_data = {}
-        session_data["username"] = self.username
-        session_data["password"] = self.password
-        session_data["expirationDate"] = "null"
-        session_data["user"] = "null"
-        payload["session"] = session_data
+        """Legacy auth — POSTs username/password to old session endpoint.
 
+        This endpoint returns 400 since KUB migrated to B2C.
+        Kept for backward compatibility signature but will raise on failure.
+        """
+        if self.access_token:
+            # Already have a token from OAuth2 flow
+            return
+
+        payload = {
+            "session": {
+                "username": self.username,
+                "password": self.password,
+                "expirationDate": "null",
+                "user": "null",
+            }
+        }
         url = "https://www.kub.org/api/auth/v1/sessions"
         response = await self.http.post(url, payload)
         if response.status == 401:
-            raise KUBAuthenticationError
-        self.session_start = datetime.now()
+            raise KUBAuthenticationError("Legacy auth failed")
 
     async def _retrieve_account_info(self):
-        """Retrieve Account Info"""
+        """Retrieve Account Info."""
         if self.account_id == "":
-            response = await self.http.fetch(
-                "https://www.kub.org/api/auth/v1/users/" + self.username
-            )
+            # Try /users/me first (works with B2C token), fall back to username
+            try:
+                response = await self.http.fetch(
+                    "https://www.kub.org/api/auth/v1/users/me"
+                )
+            except Exception:
+                if self.username:
+                    response = await self.http.fetch(
+                        "https://www.kub.org/api/auth/v1/users/" + self.username
+                    )
+                else:
+                    raise
             json = await response.json()
             self.person_id = json["person"][0]["id"]
             self.account_id = json["person"][0]["accounts"][0]
+            if not self.username:
+                self.username = json.get("username", "")
         await self._retrieve_services()
 
     async def _retrieve_services(self):
@@ -141,14 +183,14 @@ class KubUtility:
         return self.services
 
     async def retrieve_account_info(self):
-        """Retrieves account info from KUB api"""
-        async with Http() as self.http:
+        """Retrieves account info from KUB API."""
+        async with Http(self.access_token) as self.http:
             await self._retrieve_access_token()
             await self._retrieve_account_info()
 
     async def retrieve_access_token(self):
-        """Fetches access token"""
-        async with Http() as self.http:
+        """Fetches access token (legacy)."""
+        async with Http(self.access_token) as self.http:
             await self._retrieve_access_token()
 
     async def _retrieve_usage(
@@ -160,10 +202,6 @@ class KubUtility:
         utility = utility_type.name.lower()
         account = self.account[utility]
 
-        # If we are processing wastewater so just copy water
-        # This does not account for separate meters for water and wastewater
-        # However, I do not know what the response looks like to process
-        # this case properly
         if utility_type == KUBUtilityTypes.WASTEWATER:
             water = KUBUtilityTypes.WATER.name.lower()
             self.usage[utility] = copy.deepcopy(self.usage[water])
@@ -193,25 +231,19 @@ class KubUtility:
         usage_data = {}
         for idx, usage in enumerate(json["usage-value"]):
             if len(usage["usageValuesChildren"]) == 0:
-                # Pull data from the base object
                 usage_data["id"] = usage["id"]
                 usage_data["readDateTime"] = usage["readDateTime"]
 
-                # Grab the usage object via index
                 data = json["usage-aggregate"][idx]
 
-                # Read data from the usage object
                 usage_data["utilityUsed"] = data["readValue"]
                 usage_data["uom"] = data["uom"]
                 usage_data["cost"] = data["cost"]
 
-                # Create another object with key of time
                 time = datetime.fromisoformat(usage["readDateTime"]).strftime(
                     "%H:%M:%S"
                 )
                 self.usage[utility][date][time] = {}
-
-                # Apend all the data
                 self.usage[utility][date][time] = copy.deepcopy(usage_data)
 
                 if (
@@ -220,9 +252,7 @@ class KubUtility:
                 ):
                     total = data["readValue"] + total
                     total_cost = data["cost"] + total_cost
-                # print(self.usage)
             else:
-                # This is the aggregate case so create a new blank object in the list
                 date = datetime.fromisoformat(usage["readDateTime"]).strftime(
                     "%Y-%m-%d"
                 )
@@ -233,11 +263,11 @@ class KubUtility:
         return self.usage
 
     async def retrieve_last_31_days(self):
-        """Retrieve all usage for the current month"""
+        """Retrieve all usage for the last 31 days."""
         date = datetime.today() - timedelta(days=31)
         start_date = date.strftime("%Y-%m-%d")
 
-        async with Http() as self.http:
+        async with Http(self.access_token) as self.http:
             await self._retrieve_access_token()
 
             if len(self.person_id) == 0:
@@ -248,11 +278,11 @@ class KubUtility:
         return self.usage
 
     async def retrieve_monthly_usage(self):
-        """Retrieve all usage for the current month"""
-        date = datetime.today().replace(day=1).date().strftime("%Y-%m-%d")
+        """Retrieve all usage for the current month."""
+        date = datetime.today().replace(day=1).date()
         start_date = date.strftime("%Y-%m-%d")
 
-        async with Http() as self.http:
+        async with Http(self.access_token) as self.http:
             await self._retrieve_access_token()
 
             if len(self.person_id) == 0:
@@ -267,8 +297,8 @@ class KubUtility:
         start_date: str = datetime.today().strftime("%Y-%m-%d"),
         end_date: str = datetime.today().strftime("%Y-%m-%d"),
     ):
-        """Retrieve all usage for the current month"""
-        async with Http() as self.http:
+        """Retrieve usage for a date range."""
+        async with Http(self.access_token) as self.http:
             await self._retrieve_access_token()
 
             if len(self.person_id) == 0:
@@ -281,11 +311,10 @@ class KubUtility:
         return self.usage
 
     async def retrieve_monthly_summary(self):
-        """Retrieve summary of usage for the current month"""
-
+        """Retrieve summary of usage for the current month."""
         start_date = datetime.today().replace(day=1).date().strftime("%Y-%m-%d")
 
-        async with Http() as self.http:
+        async with Http(self.access_token) as self.http:
             await self._retrieve_access_token()
 
             if len(self.person_id) == 0:
@@ -295,29 +324,9 @@ class KubUtility:
         self.http = None
         return self.monthly_total
 
-    async def get_usage_by_datetime(self, usage_record: datetime = datetime.now()):
-        """Retrieve usage by datetime"""
-        await self.retrieve_monthly_usage()
-        elec = (
-            self.usage.get("electricity")
-            .get(usage_record.today().replace(day=1).date().strftime("%Y-%m-%d"))
-            .get(datetime.now(timezone.utc).strftime("%H:00:00"))
-        )
-        gas = (
-            self.usage.get("gas")
-            .get(usage_record.today().replace(day=1).date().strftime("%Y-%m-%d"))
-            .get(datetime.now(timezone.utc).strftime("%H:00:00"))
-        )
-        water = (
-            self.usage.get("water")
-            .get(usage_record.today().replace(day=1).date().strftime("%Y-%m-%d"))
-            .get(datetime.now(timezone.utc).strftime("%H:00:00"))
-        )
-        return elec, gas, water
-
     async def get_available_services(self):
-        """Returns available services for account"""
-        async with Http() as self.http:
+        """Returns available services for account."""
+        async with Http(self.access_token) as self.http:
             await self._retrieve_access_token()
 
             if len(self.person_id) == 0:
@@ -325,6 +334,7 @@ class KubUtility:
         return self.services
 
     async def verify_access(self):
-        """Verify username and password is able to retreive api token"""
-        async with Http() as self.http:
+        """Verify the access token works."""
+        async with Http(self.access_token) as self.http:
             await self._retrieve_access_token()
+            await self._retrieve_account_info()

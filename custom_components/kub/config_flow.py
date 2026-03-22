@@ -1,62 +1,94 @@
-"""Config flow for the KUB integration."""
+"""Config flow for the KUB integration using Azure AD B2C OAuth2."""
 
 import logging
 from typing import Any
 
 import voluptuous as vol
 from homeassistant import config_entries
-from homeassistant.config_entries import ConfigEntry, ConfigFlow
+from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import callback
 from homeassistant.data_entry_flow import FlowResult
-from homeassistant.exceptions import (
-    ConfigEntryAuthFailed,
-    ConfigEntryNotReady,
-    HomeAssistantError,
-)
-from kub import kub_utilities
+from homeassistant.exceptions import HomeAssistantError
+from homeassistant.helpers import config_entry_oauth2_flow
 
-from .const import CONF_WATER_STATISTICS, DOMAIN
+from .const import (
+    B2C_AUTHORIZE_URL,
+    B2C_CLIENT_ID,
+    B2C_SCOPES,
+    B2C_TOKEN_URL,
+    CONF_WATER_STATISTICS,
+    DOMAIN,
+)
 
 _LOGGER = logging.getLogger(__name__)
 
-STEP_USER_DATA_SCHEMA = vol.Schema(
-    {vol.Required("username"): str, vol.Required("password"): str}
-)
 
+class KUBOAuth2Implementation(config_entry_oauth2_flow.LocalOAuth2Implementation):
+    """KUB B2C OAuth2 implementation.
 
-async def validate_input(data: dict[str, Any]) -> dict[str, Any]:
-    """Validate the user input allows us to connect.
-
-    Data has the keys from STEP_USER_DATA_SCHEMA with values provided by the user.
+    Uses Azure AD B2C with PKCE. No client_secret required (public client).
     """
-    try:
-        username = data.get("username")
-        password = data.get("password")
-        kub = kub_utilities.KubUtility(username, password)
-        await kub.verify_access()
-    except kub_utilities.KUBAuthenticationError as error:
-        raise ConfigEntryAuthFailed(error) from error
-    except Exception as ex:
-        raise ConfigEntryNotReady(ex) from ex
 
-    # Return info that you want to store in the config entry.
-    return {
-        "title": "KUB",
-        "username": username,
-        "password": password,
-        "data": data,
-    }
+    def __init__(self, hass):
+        """Initialize KUB OAuth2."""
+        super().__init__(
+            hass,
+            domain=DOMAIN,
+            client_id=B2C_CLIENT_ID,
+            client_secret="",  # Public client, no secret
+            authorize_url=B2C_AUTHORIZE_URL,
+            token_url=B2C_TOKEN_URL,
+        )
+
+    @property
+    def extra_authorize_data(self) -> dict[str, Any]:
+        """Extra data for the authorize request."""
+        return {
+            "scope": " ".join(B2C_SCOPES),
+            "response_mode": "query",
+        }
 
 
-class KUBConfigFlow(ConfigFlow, domain=DOMAIN):
-    """Handle a config flow for KUB."""
+class KUBConfigFlow(
+    config_entry_oauth2_flow.AbstractOAuth2FlowHandler,
+    domain=DOMAIN,
+):
+    """Handle a config flow for KUB via OAuth2."""
 
-    VERSION = 1
-    CONNECTION_CLASS = config_entries.CONN_CLASS_CLOUD_POLL
+    DOMAIN = DOMAIN
+    VERSION = 2
 
-    def __init__(self) -> None:
-        """KUB Config Flow."""
-        self.api: kub_utilities.KubUtility = None
+    @property
+    def logger(self) -> logging.Logger:
+        return _LOGGER
+
+    @property
+    def extra_authorize_data(self) -> dict[str, Any]:
+        """Extra data for the authorize step."""
+        return {
+            "scope": " ".join(B2C_SCOPES),
+            "response_mode": "query",
+        }
+
+    async def async_step_user(
+        self, user_input: dict[str, Any] | None = None
+    ) -> FlowResult:
+        """Handle the user step — register OAuth2 impl and start flow."""
+        # Register our OAuth2 implementation if not already done
+        implementations = await config_entry_oauth2_flow.async_get_implementations(
+            self.hass, DOMAIN
+        )
+        if not implementations:
+            config_entry_oauth2_flow.async_register_implementation(
+                self.hass,
+                KUBOAuth2Implementation(self.hass),
+            )
+
+        return await super().async_step_user(user_input)
+
+    async def async_oauth_create_entry(self, data: dict[str, Any]) -> FlowResult:
+        """Create the config entry after OAuth2 flow completes."""
+        return self.async_create_entry(title="KUB", data=data)
 
     @staticmethod
     @callback
@@ -64,59 +96,21 @@ class KUBConfigFlow(ConfigFlow, domain=DOMAIN):
         """Get the options flow for this handler."""
         return KUBOptionsFlowHandler(config_entry)
 
-    async def async_step_user(
-        self, user_input: dict[str, Any] | None = None
-    ) -> FlowResult:
-        """Handle the initial step."""
-        errors: dict[str, str] = {}
-        if user_input is None or user_input == {}:
-            return self.async_show_form(
-                step_id="user", data_schema=STEP_USER_DATA_SCHEMA, errors=errors
-            )
-
-        try:
-            info = await validate_input(user_input)
-        except CannotConnect:
-            errors["base"] = "cannot_connect"
-        except InvalidAuth:
-            errors["base"] = "invalid_auth"
-        except Exception:  # pylint: disable=broad-except
-            _LOGGER.exception("Unexpected exception")
-            errors["base"] = "unknown"
-        else:
-            return self.async_create_entry(title=info["title"], data=info)
-
-        return self.async_show_form(
-            step_id="user", data_schema=STEP_USER_DATA_SCHEMA, errors=errors
-        )
-
-    async def _async_set_unique_id_and_abort_if_already_configured(
-        self, unique_id: str
-    ) -> None:
-        """Set the unique ID and abort if already configured."""
-        await self.async_set_unique_id(unique_id)
-        self._abort_if_unique_id_configured(
-            updates={},
-        )
-
 
 class KUBOptionsFlowHandler(config_entries.OptionsFlow):
-    """Handle Unfolded Circle Remote options."""
+    """Handle KUB options."""
 
     def __init__(self, config_entry: config_entries.ConfigEntry) -> None:
-        """Initialize options flow."""
         self.config_entry = config_entry
         self.options = dict(config_entry.options)
 
-    async def async_step_init(self, user_input=None):  # pylint: disable=unused-argument
-        """Manage the options."""
+    async def async_step_init(self, user_input=None):
         return await self.async_step_options()
 
     async def async_step_options(self, user_input=None):
-        """Handle options step two flow initialized by the user."""
         if user_input is not None:
             self.options.update(user_input)
-            return await self._update_options()
+            return self.async_create_entry(title="", data=self.options)
 
         return self.async_show_form(
             step_id="options",
@@ -132,15 +126,3 @@ class KUBOptionsFlowHandler(config_entries.OptionsFlow):
             ),
             last_step=True,
         )
-
-    async def _update_options(self):
-        """Update config entry options."""
-        return self.async_create_entry(title="", data=self.options)
-
-
-class CannotConnect(HomeAssistantError):
-    """Error to indicate we cannot connect."""
-
-
-class InvalidAuth(HomeAssistantError):
-    """Error to indicate there is invalid auth."""

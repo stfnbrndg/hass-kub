@@ -1,4 +1,4 @@
-"""The IntelliFire integration."""
+"""KUB data update coordinator."""
 
 from __future__ import annotations
 
@@ -13,10 +13,11 @@ from homeassistant.components.recorder.statistics import async_import_statistics
 from homeassistant.const import UnitOfEnergy, UnitOfVolume
 from homeassistant.core import HomeAssistant
 from homeassistant.exceptions import ConfigEntryAuthFailed
+from homeassistant.helpers import config_entry_oauth2_flow
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, UpdateFailed
-from kub import kub_utilities
 
 from .const import CONF_WATER_STATISTICS, DEVICE_SCAN_INTERVAL, DOMAIN
+from .kub import kub_utilities
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -24,7 +25,12 @@ _LOGGER = logging.getLogger(__name__)
 class KUBCoordinator(DataUpdateCoordinator[dict[str, Any]]):
     """Data update coordinator for KUB."""
 
-    def __init__(self, hass: HomeAssistant, api: kub_utilities.kubUtility) -> None:
+    def __init__(
+        self,
+        hass: HomeAssistant,
+        api: kub_utilities.KubUtility,
+        session: config_entry_oauth2_flow.OAuth2Session | None = None,
+    ) -> None:
         """Initialize the Coordinator."""
         super().__init__(
             hass,
@@ -37,6 +43,7 @@ class KUBCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         self.config_entry = config_entries.current_entry.get()
         self.entities = []
         self.api = api
+        self.session = session
         self.username = api.username
         self.password = api.password
         self.account = api.account
@@ -59,12 +66,16 @@ class KUBCoordinator(DataUpdateCoordinator[dict[str, Any]]):
     async def _async_update_data(self) -> dict[str, Any]:
         """Get the latest data from KUB."""
         try:
+            # Refresh OAuth2 token if needed
+            if self.session:
+                await self.session.async_ensure_token_valid()
+                token = self.session.token.get("access_token", "")
+                self.api.update_token(token)
+
             self.data["usage"] = await self.api.retrieve_last_31_days()
             self.data["monthly_total"] = self.api.monthly_total
             self.data["services"] = self.api.services
             self.data["service_list"] = self.api.service_list
-            # Because KUB provides historical usage/cost with a delay of approximately one day
-            # we need to insert data into statistics.
             await self._insert_statistics()
             return self.data
         except kub_utilities.KUBAuthenticationError as error:
@@ -93,27 +104,20 @@ class KUBCoordinator(DataUpdateCoordinator[dict[str, Any]]):
 
             for date in cost_reads:
                 day = cost_reads[date]
-                # Skip loading statistics that don't have a full days worth of data
-                # We will populate this day on the next pass
-                # HA displays errors in utility usage if partial day stats are added
                 if len(day) < 20:
                     continue
                 for time in day:
                     hour = day[time]
                     timestamp = hour.get("readDateTime")
                     naive_datetime = datetime.datetime.fromisoformat(timestamp)
-                    timezone = ZoneInfo("EST")
-                    start = naive_datetime.replace(tzinfo=timezone)
+                    tz = ZoneInfo("America/New_York")
+                    start = naive_datetime.replace(tzinfo=tz)
                     if (
                         last_stats_time is not None
                         and start.timestamp() <= last_stats_time
                     ):
                         continue
 
-                    # If we are processing water and user has selected to include
-                    # waste water, double count usage as KUB does. This is not
-                    # sufficient for residences with separate waste water meters.
-                    # Please help if this is you!
                     if (
                         utility.lower()
                         == kub_utilities.KUBUtilityTypes.WATER.name.lower()

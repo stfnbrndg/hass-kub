@@ -1,38 +1,29 @@
 {
   "config": {
     "step": {
-      "user": {
-        "data": {
-          "username": "[%key:common::config_flow::data::username%]",
-          "password": "[%key:common::config_flow::data::password%]"
-        }
-      },
-      "reauth_confirm": {
-        "data": {
-          "username": "[%key:common::config_flow::data::username%]",
-          "password": "[%key:common::config_flow::data::password%]"
-        },
-        "title": "[%key:common::config_flow::title%]"
+      "pick_implementation": {
+        "title": "Sign in to KUB"
       }
-    },
-    "error": {
-      "cannot_connect": "[%key:common::config_flow::error::cannot_connect%]",
-      "invalid_auth": "[%key:common::config_flow::error::invalid_auth%]",
-      "unknown": "[%key:common::config_flow::error::unknown%]"
     },
     "abort": {
       "already_configured": "[%key:common::config_flow::abort::already_configured_device%]",
-      "already_in_progress": "[%key:common::config_flow::abort::already_in_progress%]"
+      "already_in_progress": "[%key:common::config_flow::abort::already_in_progress%]",
+      "oauth_error": "Error during OAuth2 authentication.",
+      "missing_configuration": "The KUB integration is not fully configured.",
+      "authorize_url_timeout": "Timeout generating authorize URL."
+    },
+    "create_entry": {
+      "default": "Successfully authenticated with KUB."
     }
   },
   "options": {
     "step": {
       "options": {
-        "title": "[%key:common::config_flow::title%]",
+        "title": "KUB Options",
         "data": {
-          "water_statistics": "[%key:common::config_flow::data::activities_as_switches%]"
+          "water_statistics": "Include wastewater in water statistics"
         },
-        "description": "[%key:common::config_flow::activities::description%]"
+        "description": "Configure KUB integration options"
       }
     }
   }
