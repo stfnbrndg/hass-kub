@@ -13,7 +13,6 @@ from homeassistant.components.recorder.statistics import async_import_statistics
 from homeassistant.const import UnitOfEnergy, UnitOfVolume
 from homeassistant.core import HomeAssistant
 from homeassistant.exceptions import ConfigEntryAuthFailed
-from homeassistant.helpers import config_entry_oauth2_flow
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, UpdateFailed
 
 from .const import CONF_WATER_STATISTICS, DEVICE_SCAN_INTERVAL, DOMAIN
@@ -29,7 +28,7 @@ class KUBCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         self,
         hass: HomeAssistant,
         api: kub_utilities.KubUtility,
-        session: config_entry_oauth2_flow.OAuth2Session | None = None,
+        entry: config_entries.ConfigEntry | None = None,
     ) -> None:
         """Initialize the Coordinator."""
         super().__init__(
@@ -40,10 +39,9 @@ class KUBCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         )
 
         self.hass = hass
-        self.config_entry = config_entries.current_entry.get()
+        self.config_entry = entry or config_entries.current_entry.get()
         self.entities = []
         self.api = api
-        self.session = session
         self.username = api.username
         self.password = api.password
         self.account = api.account
@@ -66,11 +64,10 @@ class KUBCoordinator(DataUpdateCoordinator[dict[str, Any]]):
     async def _async_update_data(self) -> dict[str, Any]:
         """Get the latest data from KUB."""
         try:
-            # Refresh OAuth2 token if needed
-            if self.session:
-                await self.session.async_ensure_token_valid()
-                token = self.session.token.get("access_token", "")
-                self.api.update_token(token)
+            # Refresh token before API call
+            from . import _refresh_token
+            token = await _refresh_token(self.hass, self.config_entry)
+            self.api.update_token(token)
 
             self.data["usage"] = await self.api.retrieve_last_31_days()
             self.data["monthly_total"] = self.api.monthly_total
