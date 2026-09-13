@@ -1,12 +1,14 @@
 """Knoxville Utilities Board API
 
-Authenticates via OAuth2 Bearer token. The access token is obtained
-by HA's OAuth2 config flow (Azure AD B2C PKCE) and passed to this class.
+After B2C OAuth2 login, the auth code is exchanged through KUB's
+server-side token proxy which sets HTTP-only session cookies.
+All API calls use those cookies for authentication.
 """
 
 import copy
 from datetime import datetime, timedelta, timezone
 from enum import Enum
+from http.cookies import SimpleCookie
 
 import aiohttp
 
@@ -33,21 +35,29 @@ class KUBUtilityTypes(Enum):
     WASTEWATER = "WW"
 
 
-class Http:
-    """HTTP client with Bearer token auth."""
+TOKEN_PROXY_URL = "https://www.kub.org/api/auth/v1/oauth2/v2.0/token/customer"
+CLIENT_ID = "806e58e2-5935-4d1e-abce-2d85ea0dd776"
 
-    def __init__(self, access_token: str = "") -> None:
+
+class Http:
+    """HTTP client with cookie-based auth."""
+
+    def __init__(self, cookies: dict | None = None) -> None:
         self._session = None
-        self._access_token = access_token
+        self._cookies = cookies or {}
 
     async def __aenter__(self):
-        headers = {}
-        if self._access_token:
-            headers["Authorization"] = f"Bearer {self._access_token}"
+        jar = aiohttp.CookieJar()
         self._session = aiohttp.ClientSession(
             timeout=aiohttp.ClientTimeout(total=30),
-            headers=headers,
+            cookie_jar=jar,
         )
+        # Set stored cookies
+        for name, value in self._cookies.items():
+            self._session.cookie_jar.update_cookies(
+                {name: value},
+                response_url=aiohttp.client.URL("https://www.kub.org"),
+            )
         return self
 
     async def __aexit__(self, *err):
@@ -55,43 +65,39 @@ class Http:
         self._session = None
 
     async def fetch(self, url):
-        """HTTP GET with auth error handling."""
+        """HTTP GET with cookie auth."""
         resp = await self._session.get(url)
         if resp.status == 401:
-            raise KUBAuthenticationError("Access token expired or invalid")
+            raise KUBAuthenticationError("Session expired or invalid")
         resp.raise_for_status()
         return resp
 
-    async def post(self, url, payload):
-        """HTTP POST with auth error handling."""
-        resp = await self._session.post(url, json=payload)
-        if resp.status == 401:
-            raise KUBAuthenticationError("Access token expired or invalid")
-        resp.raise_for_status()
+    async def post_form(self, url, data):
+        """HTTP POST with form data (for token proxy)."""
+        form = aiohttp.FormData()
+        for k, v in data.items():
+            form.add_field(k, v)
+        resp = await self._session.post(url, data=form)
         return resp
+
+    def get_cookies(self) -> dict:
+        """Extract cookies from the session."""
+        cookies = {}
+        for cookie in self._session.cookie_jar:
+            cookies[cookie.key] = cookie.value
+        return cookies
 
 
 class KubUtility:
     """KUB utilities API client.
 
-    Can be initialized with either:
-    - access_token (OAuth2 B2C flow, preferred)
-    - username + password (legacy, will fail with B2C)
+    Uses cookie-based session auth obtained through the token proxy.
     """
 
-    def __init__(self, username_or_token: str = "", password: str = ""):
-        # Support both old (username, password) and new (token) signatures
-        if password:
-            # Legacy mode — will fail on B2C auth
-            self.username = username_or_token
-            self.password = password
-            self.access_token = ""
-        else:
-            # OAuth2 mode — token-based
-            self.username = ""
-            self.password = ""
-            self.access_token = username_or_token
-
+    def __init__(self, cookies: dict | None = None):
+        self.cookies = cookies or {}
+        self.username = ""
+        self.password = ""
         self.person_id = ""
         self.account_id = ""
         self.account = {}
@@ -106,53 +112,64 @@ class KubUtility:
         self.service_list = []
         self.http = None
 
-    def update_token(self, access_token: str):
-        """Update the access token (called after refresh)."""
-        self.access_token = access_token
+    def update_cookies(self, cookies: dict):
+        """Update stored cookies."""
+        self.cookies.update(cookies)
 
-    async def _retrieve_access_token(self):
-        """Legacy auth — POSTs username/password to old session endpoint.
+    @staticmethod
+    async def exchange_code(code: str, code_verifier: str, redirect_uri: str) -> dict:
+        """Exchange B2C auth code through KUB's token proxy.
 
-        This endpoint returns 400 since KUB migrated to B2C.
-        Kept for backward compatibility signature but will raise on failure.
+        Returns the session cookies set by the proxy.
         """
-        if self.access_token:
-            # Already have a token from OAuth2 flow
-            return
-
-        payload = {
-            "session": {
-                "username": self.username,
-                "password": self.password,
-                "expirationDate": "null",
-                "user": "null",
-            }
+        data = {
+            "code": code,
+            "client_id": CLIENT_ID,
+            "grant_type": "authorization_code",
+            "redirect_uri": redirect_uri,
+            "code_verifier": code_verifier,
         }
-        url = "https://www.kub.org/api/auth/v1/sessions"
-        response = await self.http.post(url, payload)
-        if response.status == 401:
-            raise KUBAuthenticationError("Legacy auth failed")
+
+        async with Http() as http:
+            resp = await http.post_form(TOKEN_PROXY_URL, data)
+            if resp.status != 200:
+                body = await resp.text()
+                raise KUBAuthenticationError(
+                    f"Token proxy returned {resp.status}: {body}"
+                )
+
+            # The proxy sets session cookies — capture them
+            cookies = http.get_cookies()
+            if not cookies:
+                raise KUBAuthenticationError("No session cookies received from token proxy")
+
+            return cookies
+
+    @staticmethod
+    async def refresh_session(cookies: dict) -> dict:
+        """Refresh the session via the token proxy using existing cookies."""
+        data = {
+            "client_id": CLIENT_ID,
+            "grant_type": "refresh_token",
+        }
+
+        async with Http(cookies) as http:
+            resp = await http.post_form(TOKEN_PROXY_URL, data)
+            if resp.status != 200:
+                raise KUBAuthenticationError("Session refresh failed")
+            return http.get_cookies()
 
     async def _retrieve_account_info(self):
         """Retrieve Account Info."""
         if self.account_id == "":
-            # Try /users/me first (works with B2C token), fall back to username
-            try:
-                response = await self.http.fetch(
-                    "https://www.kub.org/api/auth/v1/users/me"
-                )
-            except Exception:
-                if self.username:
-                    response = await self.http.fetch(
-                        "https://www.kub.org/api/auth/v1/users/" + self.username
-                    )
-                else:
-                    raise
+            # Try /users/me first, fall back to checking cookies for username
+            response = await self.http.fetch(
+                "https://www.kub.org/api/auth/v1/users/me"
+            )
             json = await response.json()
             self.person_id = json["person"][0]["id"]
             self.account_id = json["person"][0]["accounts"][0]
-            if not self.username:
-                self.username = json.get("username", "")
+            self.username = json.get("username", "")
         await self._retrieve_services()
 
     async def _retrieve_services(self):
@@ -184,14 +201,10 @@ class KubUtility:
 
     async def retrieve_account_info(self):
         """Retrieves account info from KUB API."""
-        async with Http(self.access_token) as self.http:
-            await self._retrieve_access_token()
+        async with Http(self.cookies) as self.http:
             await self._retrieve_account_info()
-
-    async def retrieve_access_token(self):
-        """Fetches access token (legacy)."""
-        async with Http(self.access_token) as self.http:
-            await self._retrieve_access_token()
+            # Update cookies from session
+            self.cookies.update(self.http.get_cookies())
 
     async def _retrieve_usage(
         self,
@@ -267,74 +280,18 @@ class KubUtility:
         date = datetime.today() - timedelta(days=31)
         start_date = date.strftime("%Y-%m-%d")
 
-        async with Http(self.access_token) as self.http:
-            await self._retrieve_access_token()
-
+        async with Http(self.cookies) as self.http:
             if len(self.person_id) == 0:
                 await self._retrieve_account_info()
 
             for service in self.service_list:
                 await self._retrieve_usage(service, start_date=start_date)
+
+            # Update cookies from session
+            self.cookies.update(self.http.get_cookies())
         return self.usage
-
-    async def retrieve_monthly_usage(self):
-        """Retrieve all usage for the current month."""
-        date = datetime.today().replace(day=1).date()
-        start_date = date.strftime("%Y-%m-%d")
-
-        async with Http(self.access_token) as self.http:
-            await self._retrieve_access_token()
-
-            if len(self.person_id) == 0:
-                await self._retrieve_account_info()
-            for service in self.service_list:
-                await self._retrieve_usage(service, start_date=start_date)
-        self.http = None
-        return self.usage
-
-    async def retrieve_usage_by_range(
-        self,
-        start_date: str = datetime.today().strftime("%Y-%m-%d"),
-        end_date: str = datetime.today().strftime("%Y-%m-%d"),
-    ):
-        """Retrieve usage for a date range."""
-        async with Http(self.access_token) as self.http:
-            await self._retrieve_access_token()
-
-            if len(self.person_id) == 0:
-                await self._retrieve_account_info()
-            for service in self.service_list:
-                await self._retrieve_usage(
-                    service, start_date=start_date, end_date=end_date
-                )
-        self.http = None
-        return self.usage
-
-    async def retrieve_monthly_summary(self):
-        """Retrieve summary of usage for the current month."""
-        start_date = datetime.today().replace(day=1).date().strftime("%Y-%m-%d")
-
-        async with Http(self.access_token) as self.http:
-            await self._retrieve_access_token()
-
-            if len(self.person_id) == 0:
-                await self._retrieve_account_info()
-            for service in self.service_list:
-                await self._retrieve_usage(service, start_date=start_date)
-        self.http = None
-        return self.monthly_total
-
-    async def get_available_services(self):
-        """Returns available services for account."""
-        async with Http(self.access_token) as self.http:
-            await self._retrieve_access_token()
-
-            if len(self.person_id) == 0:
-                await self._retrieve_account_info()
-        return self.services
 
     async def verify_access(self):
-        """Verify the access token works."""
-        async with Http(self.access_token) as self.http:
-            await self._retrieve_access_token()
+        """Verify the session cookies work by fetching account info."""
+        async with Http(self.cookies) as self.http:
             await self._retrieve_account_info()
