@@ -1,19 +1,25 @@
 {
   "config": {
     "step": {
-      "pick_implementation": {
-        "title": "Sign in to KUB"
+      "user": {
+        "title": "Sign in to KUB",
+        "description": "Click the link below to sign in with your KUB account."
+      },
+      "auth_code": {
+        "title": "Enter authorization code",
+        "description": "1. [Sign in to KUB]({authorize_url})\n2. After login, you'll be redirected to kub.org\n3. Copy the `code` value from the URL bar\n4. Paste it below",
+        "data": {
+          "auth_code": "Authorization code"
+        }
       }
     },
-    "abort": {
-      "already_configured": "[%key:common::config_flow::abort::already_configured_device%]",
-      "already_in_progress": "[%key:common::config_flow::abort::already_in_progress%]",
-      "oauth_error": "Error during OAuth2 authentication.",
-      "missing_configuration": "The KUB integration is not fully configured.",
-      "authorize_url_timeout": "Timeout generating authorize URL."
+    "error": {
+      "no_code": "Please enter the authorization code",
+      "invalid_auth": "Authentication failed. The code may have expired — try again.",
+      "unknown": "Unexpected error"
     },
-    "create_entry": {
-      "default": "Successfully authenticated with KUB."
+    "abort": {
+      "already_configured": "[%key:common::config_flow::abort::already_configured_device%]"
     }
   },
   "options": {
