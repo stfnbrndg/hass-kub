@@ -3,7 +3,7 @@
   "name": "Knoxville Utilities Board",
   "codeowners": ["@jackjpowell"],
   "config_flow": true,
-  "dependencies": ["http"],
+  "dependencies": [],
   "documentation": "https://github.com/JackJPowell/hass-kub",
   "homekit": {},
   "integration_type": "device",
