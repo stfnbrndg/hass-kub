@@ -1,29 +1,35 @@
 {
   "config": {
-    "abort": {
-      "already_configured": "Device is already configured",
-      "already_in_progress": "Device is pending setup",
-      "oauth_error": "Error during OAuth2 authentication.",
-      "missing_configuration": "The KUB integration is not fully configured.",
-      "authorize_url_timeout": "Timeout generating authorize URL."
-    },
     "step": {
-      "pick_implementation": {
-        "title": "Sign in to KUB"
+      "user": {
+        "title": "Sign in to KUB",
+        "description": "Click the link below to sign in with your KUB account."
+      },
+      "auth_code": {
+        "title": "Enter authorization code",
+        "description": "1. [Sign in to KUB]({authorize_url})\n2. After login, you'll be redirected to kub.org\n3. Copy the `code` value from the URL bar\n4. Paste it below",
+        "data": {
+          "auth_code": "Authorization code"
+        }
       }
     },
-    "create_entry": {
-      "default": "Successfully authenticated with KUB."
+    "error": {
+      "no_code": "Please enter the authorization code",
+      "invalid_auth": "Authentication failed. The code may have expired — try again.",
+      "unknown": "Unexpected error"
+    },
+    "abort": {
+      "already_configured": "Device is already configured"
     }
   },
   "options": {
     "step": {
       "options": {
         "title": "KUB Options",
-        "description": "Statistic Data",
         "data": {
           "water_statistics": "Include Waste Water in Water Statistics"
-        }
+        },
+        "description": "Statistic Data"
       }
     }
   }
